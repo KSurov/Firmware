@@ -48,6 +48,8 @@ ICM42688P::ICM42688P(I2CSPIBusOption bus_option, int bus, uint32_t device, enum 
 	_px4_accel(get_device_id(), rotation),
 	_px4_gyro(get_device_id(), rotation)
 {
+	_debug_enabled = true;
+
 	if (drdy_gpio != 0) {
 		_drdy_missed_perf = perf_alloc(PC_COUNT, MODULE_NAME": DRDY missed");
 	}
@@ -264,77 +266,11 @@ void ICM42688P::RunImpl()
 					perf_count(_bad_register_perf);
 					Reset();
 				}
-
-			} else {
-				// periodically update temperature (~1 Hz)
-				if (hrt_elapsed_time(&_temperature_update_timestamp) >= 1_s) {
-					UpdateTemperature();
-					_temperature_update_timestamp = now;
-				}
 			}
 		}
 
 		break;
 	}
-}
-
-void ICM42688P::ConfigureAccel()
-{
-	const uint8_t ACCEL_FS_SEL = RegisterRead(Register::BANK_0::ACCEL_CONFIG0) & (Bit7 | Bit6 | Bit5); // 7:5 ACCEL_FS_SEL
-
-	switch (ACCEL_FS_SEL) {
-	case ACCEL_FS_SEL_2G:
-		_px4_accel.set_scale(CONSTANTS_ONE_G / 16384.f);
-		_px4_accel.set_range(2.f * CONSTANTS_ONE_G);
-		break;
-
-	case ACCEL_FS_SEL_4G:
-		_px4_accel.set_scale(CONSTANTS_ONE_G / 8192.f);
-		_px4_accel.set_range(4.f * CONSTANTS_ONE_G);
-		break;
-
-	case ACCEL_FS_SEL_8G:
-		_px4_accel.set_scale(CONSTANTS_ONE_G / 4096.f);
-		_px4_accel.set_range(8.f * CONSTANTS_ONE_G);
-		break;
-
-	case ACCEL_FS_SEL_16G:
-		_px4_accel.set_scale(CONSTANTS_ONE_G / 2048.f);
-		_px4_accel.set_range(16.f * CONSTANTS_ONE_G);
-		break;
-	}
-}
-
-void ICM42688P::ConfigureGyro()
-{
-	const uint8_t GYRO_FS_SEL = RegisterRead(Register::BANK_0::GYRO_CONFIG0) & (Bit7 | Bit6 | Bit5); // 7:5 GYRO_FS_SEL
-
-	float range_dps = 0.f;
-
-	switch (GYRO_FS_SEL) {
-	case GYRO_FS_SEL_125_DPS:
-		range_dps = 125.f;
-		break;
-
-	case GYRO_FS_SEL_250_DPS:
-		range_dps = 250.f;
-		break;
-
-	case GYRO_FS_SEL_500_DPS:
-		range_dps = 500.f;
-		break;
-
-	case GYRO_FS_SEL_1000_DPS:
-		range_dps = 1000.f;
-		break;
-
-	case GYRO_FS_SEL_2000_DPS:
-		range_dps = 2000.f;
-		break;
-	}
-
-	_px4_gyro.set_scale(math::radians(range_dps / 32768.f));
-	_px4_gyro.set_range(math::radians(range_dps));
 }
 
 void ICM42688P::ConfigureSampleRate(int sample_rate)
@@ -401,8 +337,16 @@ bool ICM42688P::Configure()
 		}
 	}
 
-	ConfigureAccel();
-	ConfigureGyro();
+	// 20-bits data format used
+	//  gyroscope data consists of 19-bits of actual data and the LSB is always set to 0
+	//  accelerometer data consists of 18-bits of actual data and the two lowest order bits are always set to 0
+	//  the only FSR settings that are operational are ±2000dps for gyroscope and ±16g for accelerometer
+
+	_px4_accel.set_scale(CONSTANTS_ONE_G / 8192.f); // 8192 LSB/g
+	_px4_accel.set_range(16.f * CONSTANTS_ONE_G);
+
+	_px4_gyro.set_scale(1.f / math::radians(131.f)); // 131 LSB/dps
+	_px4_gyro.set_range(math::radians(2000.f));
 
 	return success;
 }
@@ -558,6 +502,18 @@ bool ICM42688P::FIFORead(const hrt_abstime &timestamp_sample, uint8_t samples)
 		} else if (!(FIFO_HEADER & FIFO::FIFO_HEADER_BIT::HEADER_GYRO)) {
 			// gyro bit not set
 			valid = false;
+
+		} else if (!(FIFO_HEADER & FIFO::FIFO_HEADER_BIT::HEADER_20)) {
+			// Packet does not contain a new and valid extended 20-bit data
+			valid = false;
+
+		} else if (FIFO_HEADER & FIFO::FIFO_HEADER_BIT::HEADER_ODR_ACCEL) {
+			// accel ODR changed
+			valid = false;
+
+		} else if (FIFO_HEADER & FIFO::FIFO_HEADER_BIT::HEADER_ODR_GYRO) {
+			// gyro ODR changed
+			valid = false;
 		}
 
 		if (valid) {
@@ -570,9 +526,11 @@ bool ICM42688P::FIFORead(const hrt_abstime &timestamp_sample, uint8_t samples)
 	}
 
 	if (valid_samples > 0) {
-		ProcessGyro(timestamp_sample, buffer.f, valid_samples);
-		ProcessAccel(timestamp_sample, buffer.f, valid_samples);
-		return true;
+		if (ProcessTemperature(buffer.f, valid_samples)) {
+			ProcessGyro(timestamp_sample, buffer.f, valid_samples);
+			ProcessAccel(timestamp_sample, buffer.f, valid_samples);
+			return true;
+		}
 	}
 
 	return false;
@@ -591,15 +549,50 @@ void ICM42688P::FIFOReset()
 
 void ICM42688P::ProcessAccel(const hrt_abstime &timestamp_sample, const FIFO::DATA fifo[], const uint8_t samples)
 {
+	// 18-bits of accelerometer data
+	bool scale_20bit = false;
+
+	// first scan to determine if data can fit into 16 bit output or needs to be scaled
+	for (int i = 0; i < samples; i++) {
+		// Accel X [19:12]
+		if ((fifo[i].ACCEL_DATA_X1 & 0xF0) != 0) {
+			scale_20bit = true;
+			break;
+		}
+
+		// Accel Y [19:12]
+		if ((fifo[i].ACCEL_DATA_Y1 & 0xF0) != 0) {
+			scale_20bit = true;
+			break;
+		}
+
+		// Accel Z [19:12]
+		if ((fifo[i].ACCEL_DATA_Z1 & 0xF0) != 0) {
+			scale_20bit = true;
+			break;
+		}
+	}
+
 	sensor_accel_fifo_s accel{};
 	accel.timestamp_sample = timestamp_sample;
 	accel.samples = 0;
 	accel.dt = FIFO_SAMPLE_DT;
 
 	for (int i = 0; i < samples; i++) {
-		int16_t accel_x = combine(fifo[i].ACCEL_DATA_X1, fifo[i].ACCEL_DATA_X0);
-		int16_t accel_y = combine(fifo[i].ACCEL_DATA_Y1, fifo[i].ACCEL_DATA_Y0);
-		int16_t accel_z = combine(fifo[i].ACCEL_DATA_Z1, fifo[i].ACCEL_DATA_Z0);
+		// Accel [19:12] + Accel [11:4] + Accel [3:0] (top 4 bits of 20 bit extension byte)
+		int32_t accel_x = (fifo[i].ACCEL_DATA_X1 << 12) + (fifo[i].ACCEL_DATA_X0 << 4) + (fifo[i].Ext_Accel_X_Gyro_X & 0xF0 >>
+				  4);
+		int32_t accel_y = (fifo[i].ACCEL_DATA_Y1 << 12) + (fifo[i].ACCEL_DATA_Y0 << 4) + (fifo[i].Ext_Accel_Y_Gyro_Y & 0xF0 >>
+				  4);
+		int32_t accel_z = (fifo[i].ACCEL_DATA_Z1 << 12) + (fifo[i].ACCEL_DATA_Z0 << 4) + (fifo[i].Ext_Accel_Z_Gyro_Z & 0xF0 >>
+				  4);
+
+		// 20 bit data scaled to 16 bit
+		if (scale_20bit) {
+			accel_x = accel_x >> 4;
+			accel_y = accel_y >> 4;
+			accel_z = accel_z >> 4;
+		}
 
 		// sensor's frame is +x forward, +y left, +z up
 		//  flip y & z to publish right handed with z down (x forward, y right, z down)
@@ -608,6 +601,19 @@ void ICM42688P::ProcessAccel(const hrt_abstime &timestamp_sample, const FIFO::DA
 		accel.z[accel.samples] = (accel_z == INT16_MIN) ? INT16_MAX : -accel_z;
 		accel.samples++;
 	}
+
+	static constexpr float scale = CONSTANTS_ONE_G / 8192.f; // 8192 LSB/g
+
+	if (scale_20bit) {
+		// 20 bit data scaled to 16 bit (2^4)
+		_px4_accel.set_scale(scale * 16);
+
+	} else {
+		_px4_accel.set_scale(scale);
+	}
+
+	// Insert Invalid code
+	// -524288
 
 	_px4_accel.set_error_count(perf_event_count(_bad_register_perf) + perf_event_count(_bad_transfer_perf) +
 				   perf_event_count(_fifo_empty_perf) + perf_event_count(_fifo_overflow_perf));
@@ -619,15 +625,47 @@ void ICM42688P::ProcessAccel(const hrt_abstime &timestamp_sample, const FIFO::DA
 
 void ICM42688P::ProcessGyro(const hrt_abstime &timestamp_sample, const FIFO::DATA fifo[], const uint8_t samples)
 {
+	// 20-bits of gyroscope data
+	bool scale_20bit = false;
+
+	// first scan to determine if data can fit into 16 bit output or needs to be scaled
+	for (int i = 0; i < samples; i++) {
+		// Gyro X [19:12]
+		if ((fifo[i].GYRO_DATA_X1 & 0xF0) != 0) {
+			scale_20bit = true;
+			break;
+		}
+
+		// Gyro Y [19:12]
+		if ((fifo[i].GYRO_DATA_Y1 & 0xF0) != 0) {
+			scale_20bit = true;
+			break;
+		}
+
+		// Gyro Z [19:12]
+		if ((fifo[i].GYRO_DATA_Z1 & 0xF0) != 0) {
+			scale_20bit = true;
+			break;
+		}
+	}
+
 	sensor_gyro_fifo_s gyro{};
 	gyro.timestamp_sample = timestamp_sample;
 	gyro.samples = samples;
 	gyro.dt = FIFO_SAMPLE_DT;
 
 	for (int i = 0; i < samples; i++) {
-		const int16_t gyro_x = combine(fifo[i].GYRO_DATA_X1, fifo[i].GYRO_DATA_X0);
-		const int16_t gyro_y = combine(fifo[i].GYRO_DATA_Y1, fifo[i].GYRO_DATA_Y0);
-		const int16_t gyro_z = combine(fifo[i].GYRO_DATA_Z1, fifo[i].GYRO_DATA_Z0);
+		// Gyro [19:12] + Gyro [11:4] + Gyro [3:0] (bottom 4 bits of 20 bit extension byte)
+		int32_t gyro_x = (fifo[i].GYRO_DATA_X1 << 12) + (fifo[i].GYRO_DATA_X0 << 4) + (fifo[i].Ext_Accel_X_Gyro_X & 0x0F);
+		int32_t gyro_y = (fifo[i].GYRO_DATA_Y1 << 12) + (fifo[i].GYRO_DATA_Y0 << 4) + (fifo[i].Ext_Accel_Y_Gyro_Y & 0x0F);
+		int32_t gyro_z = (fifo[i].GYRO_DATA_Z1 << 12) + (fifo[i].GYRO_DATA_Z0 << 4) + (fifo[i].Ext_Accel_Z_Gyro_Z & 0x0F);
+
+		if (scale_20bit) {
+			// 20 bit data scaled to 16 bit
+			gyro_x = gyro_x >> 4;
+			gyro_y = gyro_y >> 4;
+			gyro_z = gyro_z >> 4;
+		}
 
 		// sensor's frame is +x forward, +y left, +z up
 		//  flip y & z to publish right handed with z down (x forward, y right, z down)
@@ -636,31 +674,54 @@ void ICM42688P::ProcessGyro(const hrt_abstime &timestamp_sample, const FIFO::DAT
 		gyro.z[i] = (gyro_z == INT16_MIN) ? INT16_MAX : -gyro_z;
 	}
 
+	static constexpr float scale = 1.f / math::radians(131.f); // 131 LSB/dps
+
+	if (scale_20bit) {
+		// 20 bit data scaled to 16 bit
+		_px4_gyro.set_scale(scale * 16); // increase scale 2^4
+
+	} else {
+		_px4_gyro.set_scale(scale);
+	}
+
 	_px4_gyro.set_error_count(perf_event_count(_bad_register_perf) + perf_event_count(_bad_transfer_perf) +
 				  perf_event_count(_fifo_empty_perf) + perf_event_count(_fifo_overflow_perf));
 
 	_px4_gyro.updateFIFO(gyro);
 }
 
-void ICM42688P::UpdateTemperature()
+bool ICM42688P::ProcessTemperature(const FIFO::DATA fifo[], const uint8_t samples)
 {
-	// read current temperature
-	uint8_t temperature_buf[3] {};
-	temperature_buf[0] = static_cast<uint8_t>(Register::BANK_0::TEMP_DATA1) | DIR_READ;
-	SelectRegisterBank(REG_BANK_SEL_BIT::USER_BANK_0);
+	int16_t temperature[FIFO_MAX_SAMPLES];
+	float temperature_sum{0};
 
-	if (transfer(temperature_buf, temperature_buf, sizeof(temperature_buf)) != PX4_OK) {
-		perf_count(_bad_transfer_perf);
-		return;
+	for (int i = 0; i < samples; i++) {
+		const int16_t t = combine(fifo[i].TEMP_DATA1, fifo[i].TEMP_DATA0);
+		temperature_sum += t;
+		temperature[i] = t;
 	}
 
-	const int16_t TEMP_DATA = combine(temperature_buf[1], temperature_buf[2]);
+	const float temperature_avg = temperature_sum / samples;
 
-	// Temperature in Degrees Centigrade
-	const float TEMP_degC = (TEMP_DATA / TEMPERATURE_SENSITIVITY) + TEMPERATURE_OFFSET;
+	for (int i = 0; i < samples; i++) {
+		// temperature changing wildly is an indication of a transfer error
+		if (fabsf(temperature[i] - temperature_avg) > 1000) {
+			perf_count(_bad_transfer_perf);
+			return false;
+		}
+	}
+
+	// use average temperature reading
+	const float TEMP_degC = (temperature_avg / TEMPERATURE_SENSITIVITY) + TEMPERATURE_OFFSET;
 
 	if (PX4_ISFINITE(TEMP_degC)) {
 		_px4_accel.set_temperature(TEMP_degC);
 		_px4_gyro.set_temperature(TEMP_degC);
+		return true;
+
+	} else {
+		perf_count(_bad_transfer_perf);
 	}
+
+	return false;
 }
